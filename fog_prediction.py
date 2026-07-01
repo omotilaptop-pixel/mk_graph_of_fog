@@ -1,7 +1,4 @@
-
-#fog_predictionメインプログラム（グラフ生成)
-
-#＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝プログラムの概要＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+# -*- coding: utf-8 -*-
 """
 気象庁ダウンロード形式データ（只見_2026年1_5月_気象データ.xlsx など）を
 自動で読み込んでグラフ化するプログラム。
@@ -28,17 +25,19 @@
       9  霧雨
       10 雨
 
-【出力グラフ（5枚、1項目につき1枚）】
+【出力グラフ（5項目 × 月ごとに分割）】
   ① 気温 × 現象コード（「/」・1〜10）
   ② 降水量 × 現象コード
   ③ 風速 × 現象コード
   ④ 相対湿度 × 現象コード
   ⑤ 露点温度 × 現象コード
 
-  各グラフは、気象データの時系列（線 or 棒グラフ）の背景に、
-  その時刻に記録された現象コードを色分けした帯を重ねて表示し、
-  「気象データの値」と「'/'や1〜10の現象コード」の関係が
-  一目でわかるようにしています。
+  各グラフは、気象データの時系列（線 or 棒グラフ）と、
+  その時刻に記録された現象コード（「/」・1〜10）を“レーン”形式で
+  分けて表示する2段構成です。データ期間が長い場合に1枚の画像へ
+  詰め込みすぎて見づらくならないよう、「年-月」ごとにファイルを
+  分割して出力します（例: 5ヶ月分のデータなら、1項目につき5枚、
+  合計25枚のPNGが生成されます）。
 
 使い方:
     python3 weather_visualizer.py 入力ファイル.xlsx [出力フォルダ]
@@ -47,7 +46,6 @@ Jupyter / Google Colab で直接セルに貼って実行する場合は、
 下の DEFAULT_INPUT_FILE / DEFAULT_OUTPUT_DIR を編集してください。
 （ファイルが見つからない場合、Colabなら自動でアップロード画面が出ます）
 """
-#＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
 import sys
 import os
@@ -71,7 +69,6 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 # ---------------------------------------------------------------------------
 # 0. 日本語フォントの自動設定（文字化け対策）
 # ---------------------------------------------------------------------------
-
 _CJK_FONT_KEYWORDS = [
     "noto sans cjk", "noto serif cjk", "ipaex", "ipagothic", "ipa gothic",
     "takao", "vl gothic", "yu gothic", "ms gothic", "hiragino",
@@ -242,6 +239,7 @@ def load_weather_data(filepath, sheet_name=None):
 
     return main_df, phenom_df, phenom_cols
 
+
 # ---------------------------------------------------------------------------
 # 3. 現象コードのエンコードと、時刻ごとの代表値の計算
 # ---------------------------------------------------------------------------
@@ -280,75 +278,206 @@ def compute_phenomena_status(phenom_df, phenom_cols):
 
 
 # ---------------------------------------------------------------------------
-# 4. グラフ生成（気象データ × 現象コードの関係グラフ、1項目=1枚）
+# 3.5 グラフの横幅設定（データ期間に応じて自動で横に広げる）
 # ---------------------------------------------------------------------------
 
-def plot_metric_with_phenomena(df, metric_label, line_color, location_name,
-                                out_path, as_bar=False):
+# 1インチあたり何日分を表示するか。値を小さくするほど横に広がり、
+# 現象コードの線同士の間隔が広くなって見やすくなる。
+DAYS_PER_INCH = 0.55  # 月ごと分割にしたので、1インチあたりの日数をさらに小さくして余裕を持たせる
+MIN_FIG_WIDTH = 16    # 横幅の最小値（インチ）
+MAX_FIG_WIDTH = 60    # 横幅の最大値（インチ、1ヶ月分なのでこれで十分）
+SAVE_DPI = 150        # 保存時の解像度
+
+
+def compute_fig_width(times):
+    """データの期間（日数）に応じて、横に十分広いfigsize幅を計算する"""
+    total_days = (times.max() - times.min()).total_seconds() / 86400.0
+    width = max(total_days, 1.0) / DAYS_PER_INCH
+    return float(np.clip(width, MIN_FIG_WIDTH, MAX_FIG_WIDTH))
+
+
+def split_by_month(df):
     """
-    1つの気象データ項目について、上段に時系列（線 or 棒）、
-    下段に「/」・1〜10の現象コードを“レーン”形式で表示する2段構成のグラフ。
-
-    下段は、現象コードの値ごとに専用の行（レーン）を用意し、
-    そのコードが記録された時刻に太い縦線（vlines、太さは時間軸の解像度に
-    依存しない固定ポイント幅）を引く。これにより、線が細すぎて見えなくなる
-    問題を避け、「どの行のどの色か」で一目で現象コードを判別できる。
+    DataFrame（datetime列を含む）を「年-月」ごとに分割し、
+    [(年月文字列, 部分DataFrame), ...] のリストを返す。
     """
-    times = df["datetime"]
-    values = df[metric_label]
-    status = df["status"]
+    df = df.copy()
+    df["__ym"] = df["datetime"].dt.strftime("%Y-%m")
+    groups = []
+    for ym, sub in df.groupby("__ym", sort=True):
+        sub = sub.drop(columns="__ym").reset_index(drop=True)
+        groups.append((ym, sub))
+    return groups
 
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(16, 9), sharex=True,
-        gridspec_kw={"height_ratios": [2.3, 1.4], "hspace": 0.06},
-    )
 
-    # --- 上段: 気象データの時系列 ---
-    if as_bar:
-        ax1.bar(times, values, width=0.03, color=line_color, label=metric_label, zorder=3)
-    else:
-        ax1.plot(times, values, color=line_color, linewidth=1.0, label=metric_label, zorder=3)
-    ax1.set_title(f"【{location_name}】{metric_label} と現象コード（「/」・1〜10）の関係", fontsize=14)
-    ax1.set_ylabel(metric_label)
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc="upper right", fontsize=9)
+def split_by_month_two(main_df, phenom_df):
+    """
+    main_df と phenom_df を、同じ「年-月」の境界で同時に分割する。
+    [(年月文字列, main部分df, phenom部分df), ...] を返す。
+    """
+    m = main_df.copy()
+    p = phenom_df.copy()
+    m["__ym"] = m["datetime"].dt.strftime("%Y-%m")
+    p["__ym"] = p["datetime"].dt.strftime("%Y-%m")
+    groups = []
+    for ym in sorted(set(m["__ym"]) | set(p["__ym"])):
+        msub = m[m["__ym"] == ym].drop(columns="__ym").reset_index(drop=True)
+        psub = p[p["__ym"] == ym].drop(columns="__ym").reset_index(drop=True)
+        groups.append((ym, msub, psub))
+    return groups
 
-    # --- 下段: 現象コードのレーン表示 ---
-    lane_order = [0] + list(range(1, 11))  # 0=「/」を一番上のレーンに
-    lane_labels = ["「/」現象なし"] + [f"{c}: {PHENOM_LABELS[c]}" for c in range(1, 11)]
 
-    for row, code in enumerate(lane_order):
-        sub_times = times[status == code]
-        if len(sub_times) == 0:
-            continue
-        if code == 0:
-            # 「/」は記録頻度が非常に多いため、細め・淡色のレーンにする
-            ax2.vlines(sub_times, row - 0.35, row + 0.35,
-                       color=SLASH_COLOR, linewidth=1.2, alpha=0.9, zorder=2)
-        else:
-            ax2.vlines(sub_times, row - 0.4, row + 0.4,
-                       color=PHENOM_COLORS[code], linewidth=3.2, zorder=3)
+def _draw_lane_panel(ax2, phenom_df, phenom_cols, encoded):
+    """下段パネル（J〜AP列33行レーン）の描画処理を共通化した関数。"""
+    ptimes = phenom_df["datetime"]
+    n_lanes = len(phenom_cols)
 
-    # レーンの境界線（見やすさのための薄いガイド線）
-    for row in range(len(lane_order) + 1):
-        ax2.axhline(row - 0.5, color="#e0e0e0", linewidth=0.6, zorder=1)
+    for row, col_letter in enumerate(phenom_cols):
+        col_values = encoded[col_letter].to_numpy()
+        slash_mask = col_values == 0
+        if slash_mask.any():
+            ax2.vlines(ptimes[slash_mask], row - 0.35, row + 0.35,
+                       color=SLASH_COLOR, linewidth=1.0, alpha=0.9, zorder=2)
+        for code in range(1, 11):
+            code_mask = col_values == code
+            if code_mask.any():
+                ax2.vlines(ptimes[code_mask], row - 0.42, row + 0.42,
+                           color=PHENOM_COLORS[code], linewidth=2.4, zorder=3)
 
-    ax2.set_yticks(range(len(lane_order)))
-    ax2.set_yticklabels(lane_labels, fontsize=9)
-    ax2.set_ylim(len(lane_order) - 0.5, -0.5)  # 上から「/」→1→…→10 の順に表示
+    for row in range(n_lanes + 1):
+        ax2.axhline(row - 0.5, color="#ececec", linewidth=0.5, zorder=1)
+
+    ax2.set_yticks(range(n_lanes))
+    ax2.set_yticklabels([f"列{c}" for c in phenom_cols], fontsize=8)
+    ax2.set_ylim(n_lanes - 0.5, -0.5)
     ax2.set_xlabel("日時")
-    ax2.set_ylabel("現象コード", fontsize=10)
+    ax2.set_ylabel("J〜AP列（現象記録列）", fontsize=10)
 
+    legend_handles = [Patch(facecolor=SLASH_COLOR, label="「/」現象なし")]
+    for code in range(1, 11):
+        legend_handles.append(Patch(facecolor=PHENOM_COLORS[code],
+                                    label=f"{code}: {PHENOM_LABELS[code]}"))
+    ax2.legend(handles=legend_handles, bbox_to_anchor=(1.0, 1.0), loc="upper left",
+               fontsize=8, borderaxespad=0., title="現象コード", title_fontsize=9)
+
+
+def _finalize_figure(fig, ax1, ax2, times, fig_width):
+    """時刻軸の共通設定と保存前の最終処理"""
     ax2.xaxis_date()
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
-    ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+    n_ticks_target = max(10, int(fig_width / 1.3))
+    ax2.xaxis.set_major_locator(
+        mdates.AutoDateLocator(minticks=n_ticks_target, maxticks=n_ticks_target * 2)
+    )
     ax1.set_xlim(times.iloc[0], times.iloc[-1])
     fig.autofmt_xdate()
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+
+def _make_fig(times, phenom_cols):
+    """共通のfigure・2段subplotsを作成して返す"""
+    n_lanes = len(phenom_cols)
+    fig_width = compute_fig_width(times)
+    lane_panel_height = max(6.0, n_lanes * 0.22)
+    fig_height = 5.5 + lane_panel_height
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(fig_width, fig_height), sharex=True,
+        gridspec_kw={"height_ratios": [5.5, lane_panel_height], "hspace": 0.04},
+    )
+    return fig, ax1, ax2, fig_width
+
+
+def plot_temp_humid_dew(main_df, phenom_df, phenom_cols, location_name, out_path):
+    """
+    グラフ①: 気温・露点温度・相対湿度 の複合グラフ + J〜AP列レーン
+
+      左軸（℃）: 気温(℃) — 赤  /  露点温度(℃) — ティール
+      右軸（％）: 相対湿度(％) — 紫（半透明）
+    """
+    times   = main_df["datetime"]
+    encoded = phenom_df[phenom_cols].map(encode_phenomena_cell)
+    fig, ax1, ax2, fig_width = _make_fig(times, phenom_cols)
+
+    # 左軸: 気温・露点温度（℃）
+    l1, = ax1.plot(times, main_df["気温(℃)"],    color="#e74c3c", linewidth=1.1,
+                   label="気温(℃)", zorder=3)
+    l2, = ax1.plot(times, main_df["露点温度(℃)"], color="#16a085", linewidth=1.1,
+                   label="露点温度(℃)", zorder=3)
+    ax1.set_ylabel("気温・露点温度（℃）", fontsize=10)
+    ax1.grid(True, alpha=0.25)
+
+    # 右軸: 相対湿度（%）
+    ax1r = ax1.twinx()
+    l3, = ax1r.plot(times, main_df["相対湿度(％)"], color="#8e44ad", linewidth=0.9,
+                    alpha=0.65, label="相対湿度(％)", zorder=2)
+    ax1r.set_ylabel("相対湿度（％）", fontsize=10)
+    ax1r.set_ylim(0, 115)
+
+    ax1.set_title(
+        f"【{location_name}】気温・露点温度（左軸℃）・相対湿度（右軸%） と J〜AP列（現象コード）の関係",
+        fontsize=13)
+    ax1.legend(handles=[l1, l2, l3], loc="upper left", fontsize=9)
+
+    _draw_lane_panel(ax2, phenom_df, phenom_cols, encoded)
+    _finalize_figure(fig, ax1, ax2, times, fig_width)
+
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
-    print(f"保存しました: {out_path}")
+    print(f"保存しました: {out_path}（横幅 約{fig_width:.0f}インチ）")
+
+
+def plot_wind_precip(main_df, phenom_df, phenom_cols, location_name, out_path):
+    """
+    グラフ②: 風速・降水量 の複合グラフ + J〜AP列レーン
+
+      左軸（m/s）: 風速(m/s) — 緑の実線
+      右軸（mm） : 降水量(mm) — 青の棒グラフ（半透明）
+    """
+    times   = main_df["datetime"]
+    encoded = phenom_df[phenom_cols].map(encode_phenomena_cell)
+    fig, ax1, ax2, fig_width = _make_fig(times, phenom_cols)
+
+    # 左軸: 風速（m/s）
+    l1, = ax1.plot(times, main_df["風速(m/s)"], color="#27ae60", linewidth=1.1,
+                   label="風速(m/s)", zorder=3)
+    ax1.set_ylabel("風速（m/s）", fontsize=10)
+    ax1.grid(True, alpha=0.25)
+
+    # 右軸: 降水量（mm） — 棒グラフ
+    ax1r = ax1.twinx()
+    ax1r.bar(times, main_df["降水量(mm)"], width=0.03, color="#2980b9",
+             alpha=0.55, label="降水量(mm)", zorder=2)
+    pmax = main_df["降水量(mm)"].dropna().max() if not main_df["降水量(mm)"].dropna().empty else 1.0
+    ax1r.set_ylim(0, max(pmax * 3.5, 2.0))
+    ax1r.set_ylabel("降水量（mm）", fontsize=10)
+
+    ax1.set_title(
+        f"【{location_name}】風速（左軸m/s）・降水量（右軸mm） と J〜AP列（現象コード）の関係",
+        fontsize=13)
+    ax1.legend(handles=[l1, matplotlib.patches.Patch(color="#2980b9", alpha=0.55,
+               label="降水量(mm)")], loc="upper left", fontsize=9)
+
+    _draw_lane_panel(ax2, phenom_df, phenom_cols, encoded)
+    _finalize_figure(fig, ax1, ax2, times, fig_width)
+
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"保存しました: {out_path}（横幅 約{fig_width:.0f}インチ）")
+
+
+def plot_combo_by_month(main_df, phenom_df, phenom_cols, location_name, out_dir):
+    """2種類の複合グラフを月ごとに分割して出力するラッパー関数"""
+    for ym, msub, psub in split_by_month_two(main_df, phenom_df):
+        if msub["datetime"].nunique() < 2:
+            continue
+        loc = f"{location_name}（{ym}）"
+        plot_temp_humid_dew(
+            msub, psub, phenom_cols, loc,
+            os.path.join(out_dir, f"{location_name}_①気温・湿度・露点×現象コード_{ym}.png"),
+        )
+        plot_wind_precip(
+            msub, psub, phenom_cols, loc,
+            os.path.join(out_dir, f"{location_name}_②風速・降水量×現象コード_{ym}.png"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -463,39 +592,10 @@ def main():
     base = os.path.splitext(os.path.basename(filepath))[0]
     location_name = base.split("_")[0] if "_" in base else base
 
-    # 各時刻の現象コード代表値を計算し、main_dfにマージ
-    status_series = compute_phenomena_status(phenom_df, phenom_cols)
-    status_df = pd.DataFrame({"datetime": phenom_df["datetime"], "status": status_series})
-    merged = pd.merge(main_df, status_df, on="datetime", how="left")
+    # ① 気温・露点温度・相対湿度  ②風速・降水量 を月ごとに生成
+    plot_combo_by_month(main_df, phenom_df, phenom_cols, location_name, out_dir)
 
-    # ① 気温 × 現象コード
-    plot_metric_with_phenomena(
-        merged, "気温(℃)", "#e74c3c", location_name,
-        os.path.join(out_dir, f"{location_name}_①気温×現象コード.png"),
-    )
-    # ② 降水量 × 現象コード
-    plot_metric_with_phenomena(
-        merged, "降水量(mm)", "#2980b9", location_name,
-        os.path.join(out_dir, f"{location_name}_②降水量×現象コード.png"),
-        as_bar=True,
-    )
-    # ③ 風速 × 現象コード
-    plot_metric_with_phenomena(
-        merged, "風速(m/s)", "#27ae60", location_name,
-        os.path.join(out_dir, f"{location_name}_③風速×現象コード.png"),
-    )
-    # ④ 相対湿度 × 現象コード
-    plot_metric_with_phenomena(
-        merged, "相対湿度(％)", "#8e44ad", location_name,
-        os.path.join(out_dir, f"{location_name}_④相対湿度×現象コード.png"),
-    )
-    # ⑤ 露点温度 × 現象コード
-    plot_metric_with_phenomena(
-        merged, "露点温度(℃)", "#16a085", location_name,
-        os.path.join(out_dir, f"{location_name}_⑤露点温度×現象コード.png"),
-    )
-
-    print("すべてのグラフを生成しました。")
+    print("すべてのグラフを生成しました（月ごとに分割、各2種×月数枚ずつ出力）。")
 
 
 if __name__ == "__main__":
